@@ -2,135 +2,124 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
 	"os/exec"
-	"strings"
+	"path"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
-	videoID, err := uuid.Parse(r.PathValue("videoID"))
+	const uploadLimit = 1 << 30
+	r.Body = http.MaxBytesReader(w, r.Body, uploadLimit)
+
+	videoIDString := r.PathValue("videoID")
+	videoID, err := uuid.Parse(videoIDString)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to parse UUID", err)
+		respondWithError(w, http.StatusBadRequest, "Invalid ID", err)
 		return
 	}
 
-	bearerToken, err := auth.GetBearerToken(r.Header)
+	token, err := auth.GetBearerToken(r.Header)
 	if err != nil {
-		respondWithError(w, http.StatusUnauthorized, "unable to get bearer token", err)
+		respondWithError(w, http.StatusUnauthorized, "Couldn't find JWT", err)
 		return
 	}
 
-	userID, err := auth.ValidateJWT(bearerToken, cfg.jwtSecret)
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
 	if err != nil {
-		respondWithError(w, http.StatusUnauthorized, "unable to validate jwt", err)
+		respondWithError(w, http.StatusUnauthorized, "Couldn't validate JWT", err)
 		return
 	}
 
 	video, err := cfg.db.GetVideo(videoID)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to get video", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't find video", err)
 		return
 	}
-
 	if video.UserID != userID {
-		respondWithError(w, http.StatusUnauthorized, "action not allowed", nil)
+		respondWithError(w, http.StatusUnauthorized, "Not authorized to update this video", nil)
 		return
 	}
 
-	file, fileHeader, err := r.FormFile("video")
+	file, handler, err := r.FormFile("video")
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to form file", err)
+		respondWithError(w, http.StatusBadRequest, "Unable to parse form file", err)
 		return
 	}
-
 	defer file.Close()
 
-	mediaType, _, err := mime.ParseMediaType(fileHeader.Header.Get("Content-Type"))
+	mediaType, _, err := mime.ParseMediaType(handler.Header.Get("Content-Type"))
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "uable to mime parse media type", err)
+		respondWithError(w, http.StatusBadRequest, "Invalid Content-Type", err)
 		return
 	}
-
 	if mediaType != "video/mp4" {
-		respondWithError(w, http.StatusBadRequest, "media is not of video-type", nil)
+		respondWithError(w, http.StatusBadRequest, "Invalid file type, only MP4 is allowed", nil)
 		return
 	}
 
 	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to create temp file", err)
+		respondWithError(w, http.StatusInternalServerError, "Could not create temp file", err)
 		return
 	}
-
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
 	if _, err := io.Copy(tempFile, file); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to copy", err)
+		respondWithError(w, http.StatusInternalServerError, "Could not write file to disk", err)
 		return
 	}
 
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not reset file pointer", err)
+		return
+	}
+
+	directory := ""
 	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to get aspect ratio", err)
+		respondWithError(w, http.StatusInternalServerError, "Error determining aspect ratio", err)
 		return
 	}
-
-	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to restart reading from temp", err)
-		return
-	}
-
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to read into bytes", err)
-		return
-	}
-	encodedString := base64.RawURLEncoding.EncodeToString(bytes)
-	fileType := strings.Split(mediaType, "/")[1]
-	fileNameWithType := fmt.Sprintf("%s.%s", encodedString, fileType)
-
-	prefix := ""
 	switch aspectRatio {
 	case "16:9":
-		prefix = "landscape"
+		directory = "landscape"
 	case "9:16":
-		prefix = "portrait"
-	case "other":
-		prefix = "other"
+		directory = "portrait"
 	default:
-		prefix = "other"
+		directory = "other"
 	}
 
-	key := fmt.Sprintf("%s/%s", prefix, fileNameWithType)
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
-
-	if _, err := cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
-		Bucket:      &cfg.s3Bucket,
-		Key:         &key,
+	key := getAssetPath(mediaType)
+	key = path.Join(directory, key)
+	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
+		Bucket:      aws.String(cfg.s3Bucket),
+		Key:         aws.String(key),
 		Body:        tempFile,
-		ContentType: &mediaType,
-	}); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to put into bucket", err)
+		ContentType: aws.String(mediaType),
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error uploading file to S3", err)
 		return
 	}
 
-	video.VideoURL = &videoURL
-
-	if err := cfg.db.UpdateVideo(video); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to update video", err)
+	url := cfg.getObjectURL(key)
+	video.VideoURL = &url
+	err = cfg.db.UpdateVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't update video", err)
 		return
 	}
 
@@ -138,38 +127,50 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {
-	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
-	buffer := &bytes.Buffer{}
-	cmd.Stdout = buffer
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams",
+		filePath,
+	)
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("unable to run command %v, error: %w", cmd, err)
+		return "", fmt.Errorf("ffprobe error: %v", err)
 	}
 
-	type ffprobeStruct struct {
+	var output struct {
 		Streams []struct {
 			Width  int `json:"width"`
 			Height int `json:"height"`
 		} `json:"streams"`
 	}
-
-	data := ffprobeStruct{}
-	if err := json.Unmarshal(buffer.Bytes(), &data); err != nil {
-		return "", fmt.Errorf("unable to unmarshal json, error: %w", err)
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		return "", fmt.Errorf("could not parse ffprobe output: %v", err)
 	}
 
-	if len(data.Streams) == 0 {
-		return "", fmt.Errorf("invalid data")
+	if len(output.Streams) == 0 {
+		return "", errors.New("no video streams found")
 	}
 
-	height := data.Streams[0].Height
-	width := data.Streams[0].Width
-	ratio := width / height
+	width := output.Streams[0].Width
+	height := output.Streams[0].Height
 
-	if ratio == 1 {
+	if width == 16*height/9 {
 		return "16:9", nil
-	}
-	if ratio == 0 {
+	} else if height == 16*width/9 {
 		return "9:16", nil
 	}
 	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := fmt.Sprintf("%s.processing", filePath)
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("unable to run command %v, error: %w", cmd, err)
+	}
+	return outputFilePath, nil
 }
